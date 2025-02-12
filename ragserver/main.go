@@ -3,8 +3,9 @@
 // license that can be found in the LICENSE file.
 
 // Command ragserver is an HTTP server that implements RAG (Retrieval
-// Augmented Generation) using the Gemini model and Weaviate. See the
-// accompanying README file for additional details.
+// Augmented Generation) using the Gemini model and Weaviate, which
+// are accessed using the Genkit package. See the accompanying README file for
+// additional details.
 package main
 
 import (
@@ -16,11 +17,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/google/generative-ai-go/genai"
-	"github.com/weaviate/weaviate-go-client/v4/weaviate"
-	"github.com/weaviate/weaviate-go-client/v4/weaviate/graphql"
-	"github.com/weaviate/weaviate/entities/models"
-	"google.golang.org/api/option"
+	"github.com/firebase/genkit/go/ai"
+	"github.com/firebase/genkit/go/plugins/googleai"
+	"github.com/firebase/genkit/go/plugins/ollama"
+	"github.com/firebase/genkit/go/plugins/weaviate"
 )
 
 const generativeModelName = "gemini-1.5-flash"
@@ -31,23 +31,42 @@ const embeddingModelName = "text-embedding-004"
 // AI), initializes the server state and registers HTTP handlers.
 func main() {
 	ctx := context.Background()
-	wvClient, err := initWeaviate(ctx)
+
+	if err := ollama.Init(ctx, &ollama.Config{
+		ServerAddress: "127.0.0.1:11434",
+	}); err != nil {
+		log.Fatal(err)
+		return
+	}
+
+	wvConfig := &weaviate.ClientConfig{
+		Scheme: "http",
+		Addr:   "localhost:" + cmp.Or(os.Getenv("WVPORT"), "9035"),
+	}
+	_, err := weaviate.Init(ctx, wvConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	apiKey := os.Getenv("GEMINI_API_KEY")
-	genaiClient, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+	classConfig := &weaviate.ClassConfig{
+		Class:    "Document",
+		Embedder: googleai.Embedder(embeddingModelName),
+	}
+	indexer, retriever, err := weaviate.DefineIndexerAndRetriever(ctx, *classConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer genaiClient.Close()
+
+	model := googleai.Model(generativeModelName)
+	if model == nil {
+		log.Fatal("unable to set up gemini-1.5-flash model")
+	}
 
 	server := &ragServer{
-		ctx:      ctx,
-		wvClient: wvClient,
-		genModel: genaiClient.GenerativeModel(generativeModelName),
-		embModel: genaiClient.EmbeddingModel(embeddingModelName),
+		ctx:       ctx,
+		indexer:   indexer,
+		retriever: retriever,
+		model:     model,
 	}
 
 	mux := http.NewServeMux()
@@ -61,10 +80,10 @@ func main() {
 }
 
 type ragServer struct {
-	ctx      context.Context
-	wvClient *weaviate.Client
-	genModel *genai.GenerativeModel
-	embModel *genai.EmbeddingModel
+	ctx       context.Context
+	indexer   ai.Indexer
+	retriever ai.Retriever
+	model     ai.Model
 }
 
 func (rs *ragServer) addDocumentsHandler(w http.ResponseWriter, req *http.Request) {
@@ -76,47 +95,22 @@ func (rs *ragServer) addDocumentsHandler(w http.ResponseWriter, req *http.Reques
 		Documents []document
 	}
 	ar := &addRequest{}
-
 	err := readRequestJSON(req, ar)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Use the batch embedding API to embed all documents at once.
-	batch := rs.embModel.NewBatch()
+	// Convert request documents into Weaviate documents used for embedding.
+	var wvDocs []*ai.Document
 	for _, doc := range ar.Documents {
-		batch.AddContent(genai.Text(doc.Text))
-	}
-	log.Printf("invoking embedding model with %v documents", len(ar.Documents))
-	rsp, err := rs.embModel.BatchEmbedContents(rs.ctx, batch)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if len(rsp.Embeddings) != len(ar.Documents) {
-		http.Error(w, "embedded batch size mismatch", http.StatusInternalServerError)
-		return
+		wvDocs = append(wvDocs, ai.DocumentFromText(doc.Text, nil))
 	}
 
-	// Convert our documents - along with their embedding vectors - into types
-	// used by the Weaviate client library.
-	objects := make([]*models.Object, len(ar.Documents))
-	for i, doc := range ar.Documents {
-		objects[i] = &models.Object{
-			Class: "Document",
-			Properties: map[string]any{
-				"text": doc.Text,
-			},
-			Vector: rsp.Embeddings[i].Values,
-		}
-	}
-
-	// Store documents with embeddings in the Weaviate DB.
-	log.Printf("storing %v objects in weaviate", len(objects))
-	_, err = rs.wvClient.Batch().ObjectsBatcher().WithObjects(objects...).Do(rs.ctx)
+	// Index the requested documents.
+	err = ai.Index(rs.ctx, rs.indexer, ai.WithIndexerDocs(wvDocs...))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, fmt.Errorf("indexing: %w", err).Error(), http.StatusInternalServerError)
 		return
 	}
 }
@@ -133,62 +127,40 @@ func (rs *ragServer) queryHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Embed the query contents.
-	rsp, err := rs.embModel.EmbedContent(rs.ctx, genai.Text(qr.Content))
+	// Find the most similar documents using the retriever.
+	resp, err := ai.Retrieve(rs.ctx,
+		rs.retriever,
+		ai.WithRetrieverDoc(ai.DocumentFromText(qr.Content, nil)),
+		ai.WithRetrieverOpts(&weaviate.RetrieverOptions{
+			Count: 3,
+		}))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, fmt.Errorf("retrieval: %w", err).Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Search weaviate to find the most relevant (closest in vector space)
-	// documents to the query.
-	gql := rs.wvClient.GraphQL()
-	result, err := gql.Get().
-		WithNearVector(
-			gql.NearVectorArgBuilder().WithVector(rsp.Embedding.Values)).
-		WithClassName("Document").
-		WithFields(graphql.Field{Name: "text"}).
-		WithLimit(3).
-		Do(rs.ctx)
-	if werr := combinedWeaviateError(result, err); werr != nil {
-		http.Error(w, werr.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	contents, err := decodeGetResults(result)
-	if err != nil {
-		http.Error(w, fmt.Errorf("reading weaviate response: %w", err).Error(), http.StatusInternalServerError)
-		return
+	var docsContents []string
+	for _, d := range resp.Documents {
+		docsContents = append(docsContents, d.Content[0].Text)
 	}
 
 	// Create a RAG query for the LLM with the most relevant documents as
 	// context.
-	ragQuery := fmt.Sprintf(ragTemplateStr, qr.Content, strings.Join(contents, "\n"))
-	resp, err := rs.genModel.GenerateContent(rs.ctx, genai.Text(ragQuery))
+	ragQuery := fmt.Sprintf(ragTemplateStr, qr.Content, strings.Join(docsContents, "\n"))
+	genResp, err := ai.Generate(rs.ctx, rs.model, ai.WithTextPrompt(ragQuery))
 	if err != nil {
 		log.Printf("calling generative model: %v", err.Error())
 		http.Error(w, "generative model error", http.StatusInternalServerError)
 		return
 	}
 
-	if len(resp.Candidates) != 1 {
-		log.Printf("got %v candidates, expected 1", len(resp.Candidates))
+	if len(genResp.Candidates) != 1 {
+		log.Printf("got %v candidates, expected 1", len(genResp.Candidates))
 		http.Error(w, "generative model error", http.StatusInternalServerError)
 		return
 	}
 
-	var respTexts []string
-	for _, part := range resp.Candidates[0].Content.Parts {
-		if pt, ok := part.(genai.Text); ok {
-			respTexts = append(respTexts, string(pt))
-		} else {
-			log.Printf("bad type of part: %v", pt)
-			http.Error(w, "generative model error", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	renderJSON(w, strings.Join(respTexts, "\n"))
+	renderJSON(w, genResp.Text())
 }
 
 const ragTemplateStr = `
@@ -211,36 +183,3 @@ Question:
 Context:
 %s
 `
-
-// decodeGetResults decodes the result returned by Weaviate's GraphQL Get
-// query; these are returned as a nested map[string]any (just like JSON
-// unmarshaled into a map[string]any). We have to extract all document contents
-// as a list of strings.
-func decodeGetResults(result *models.GraphQLResponse) ([]string, error) {
-	data, ok := result.Data["Get"]
-	if !ok {
-		return nil, fmt.Errorf("Get key not found in result")
-	}
-	doc, ok := data.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("Get key unexpected type")
-	}
-	slc, ok := doc["Document"].([]any)
-	if !ok {
-		return nil, fmt.Errorf("Document is not a list of results")
-	}
-
-	var out []string
-	for _, s := range slc {
-		smap, ok := s.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("invalid element in list of documents")
-		}
-		s, ok := smap["text"].(string)
-		if !ok {
-			return nil, fmt.Errorf("expected string in list of documents")
-		}
-		out = append(out, s)
-	}
-	return out, nil
-}
